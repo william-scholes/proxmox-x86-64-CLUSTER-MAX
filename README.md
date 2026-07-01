@@ -141,3 +141,10 @@ This script forcefully overrides native Proxmox virtualization guardrails. While
 
 > [!NOTE]
 > This script was only tested on Proxmox VE cluster version 9.2.3. Your mileage may vary (YMMV) on other versions.
+
+---
+
+## Author
+
+* **William Scholes** - [william-scholes](https://github.com/william-scholes)
+
