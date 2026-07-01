@@ -1,0 +1,10 @@
+# Backup files
+*.bak
+*~
+
+# OS/System files
+.DS_Store
+Thumbs.db
+
+# Shell history / logs
+*.log
