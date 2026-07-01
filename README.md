@@ -114,6 +114,12 @@ Once the script successfully runs, the new CPU profile will be available in the 
 
 ---
 
+## Screenshots
+
+<img width="2554" height="964" alt="image" src="https://github.com/user-attachments/assets/b871e34b-54aa-456e-8810-ca3cf1164c78" />
+
+---
+
 ## How It Works Under the Hood
 
 1. **Dependency Check:** Verifies `jq`, `pvesh`, `awk`, `ssh`, and `qemu-system-x86_64` are present.
