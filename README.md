@@ -17,7 +17,7 @@ Instead of relying on rigid baselines, this script acts as a dynamic calculator 
 * **Dynamic Node Discovery:** Uses the Proxmox API (`pvesh` and `jq`) to deterministically find all online cluster nodes.
 * **Mathematical Intersection:** Pulls `/proc/cpuinfo` from every host and mathematically intersects the lists down to the lowest common denominator.
 * **Native QEMU Allowlist:** Dynamically queries your local `qemu-system-x86_64` binary for supported CPUID flags to ensure it never passes unrecognized instructions to the emulator.
-* **KVM Hardware Blocklist:** Reads from a customizable blocklist to strip out bare-metal power-management flags (like `acpi` and `est`) that crash KVM.
+* **KVM Hardware Blocklist:** Automatically filters out raw hardware and power-management flags (such as `acpi` and `est`) using a built-in blocklist to prevent KVM virtualization crashes.
 * **Zero-Touch Sync:** Writes directly to the Proxmox Cluster Filesystem (`pmxcfs`), immediately propagating the custom CPU profile to all nodes in the cluster.
 
 ---
@@ -34,41 +34,7 @@ apt update && apt install jq -y
 
 ## Setup & Usage
 
-### 1. Create the KVM Blocklist
-
-KVM refuses to virtualize physical hardware and power-management states. You must define a blocklist so the script knows which raw kernel flags to strip out before handing the profile to QEMU/KVM.
-
-Create the configuration file:
-
-```bash
-mkdir -p /etc/pve/virtual-guest
-nano /etc/pve/virtual-guest/kvm-blocklist.conf
-```
-
-Paste the following known physical flags into the file (one per line):
-
-```text
-acpi
-tm
-tm2
-pbe
-dtes64
-monitor
-ds-cpl
-smx
-est
-xtpr
-vnmi
-pdcm
-ht
-dts
-ds
-vme
-```
-
-*Save and exit.*
-
-### 2. Run the Script
+### 1. Run the Script
 
 Execute the script on **any single node** in your cluster. (You do not need to run this on every node; the Proxmox cluster filesystem will automatically sync the output).
 
@@ -102,7 +68,7 @@ Checking node: proxmox1... Found 82 raw flags.
 root@proxmox3:~#
 ```
 
-### 3. Apply the Custom CPU to a VM
+### 2. Apply the Custom CPU to a VM
 
 Once the script successfully runs, the new CPU profile will be available in the Proxmox Web GUI.
 
@@ -126,7 +92,7 @@ Once the script successfully runs, the new CPU profile will be available in the 
 2. **QEMU Query:** Runs `qemu-system-x86_64 -cpu help` to build a dynamic array of hypervisor-supported instructions.
 3. **Node Query:** Loops through all online nodes via internal SSH and reads `grep -m1 '^flags' /proc/cpuinfo`.
 4. **Intersection:** Compares all arrays and deletes any flags that do not exist on 100% of the active nodes.
-5. **Filtering:** Passes the surviving flags through the QEMU allowlist and the KVM `kvm-blocklist.conf` file.
+5. **Filtering:** Passes the surviving flags through the QEMU allowlist and the built-in KVM hardware blocklist.
 6. **Configuration:** Appends the highly optimized `+flag;+flag` syntax to `/etc/pve/virtual-guest/cpu-models.conf`, using `qemu64` as the emulation base model.
 
 ---
