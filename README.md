@@ -138,3 +138,6 @@ Once the script successfully runs, the new CPU profile will be available in the 
 ## Disclaimer
 
 This script forcefully overrides native Proxmox virtualization guardrails. While the generated output relies on the actual overlapping instruction sets of your hardware, extreme hardware discrepancies (e.g., migrating between vastly different architectures) may still result in unexpected guest OS behavior. Test live migrations thoroughly before using in a production environment.
+
+> [!NOTE]
+> This script was only tested on Proxmox VE cluster version 9.2.3. Your mileage may vary (YMMV) on other versions.
