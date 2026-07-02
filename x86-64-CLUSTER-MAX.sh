@@ -1,30 +1,71 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Default values
 TARGET_MODEL="x86-64-CLUSTER-MAX"
-MODEL_PROVIDED=false
-SPECIFIC_NODES=""
+CUSTOM_CPU_DIR="/etc/pve/virtual-guest"
+CUSTOM_CPU_FILE="${CUSTOM_CPU_DIR}/cpu-models.conf"
+BLOCKLIST=("acpi" "tm" "tm2" "pbe" "dtes64" "monitor" "ds-cpl" "smx" "est" "xtpr" "vnmi" "pdcm" "ht" "dts" "ds" "vme" "intel-pt")
 
-# Parse command line arguments
-while getopts "m:n:" opt; do
-    case ${opt} in
-        m)
-            TARGET_MODEL=$OPTARG
-            MODEL_PROVIDED=true
+# Help function
+usage() {
+    echo "Proxmox Max Cluster CPU Generator"
+    echo ""
+    echo "Usage: $0 [options]"
+    echo ""
+    echo "Options:"
+    echo "  -n, --nodes <list>   Comma-separated list of specific nodes to query (e.g. node1,node2)"
+    echo "  -m, --model <name>   Custom name for the generated CPU profile (e.g. x86-64-CUSTOM)"
+    echo "                       (Mandatory if -n/--nodes is specified)"
+    echo "  -h, --help           Show this help message"
+    echo ""
+    echo "If no options are specified, the script automatically queries all active cluster nodes"
+    echo "and defaults the model name to 'x86-64-CLUSTER-MAX'."
+    exit 0
+}
+
+# Option parsing
+NODES_INPUT=""
+MODEL_INPUT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
             ;;
-        n)
-            SPECIFIC_NODES=$OPTARG
+        -n|--nodes)
+            if [ -z "${2+x}" ] || [[ "$2" =~ ^- ]]; then
+                echo "❌ ERROR: --nodes requires a non-empty argument."
+                exit 1
+            fi
+            NODES_INPUT="$2"
+            shift 2
             ;;
-        \?)
-            echo "Usage: $0 [-m custom_model_name] [-n node1,node2]"
+        -m|--model)
+            if [ -z "${2+x}" ] || [[ "$2" =~ ^- ]]; then
+                echo "❌ ERROR: --model requires a non-empty argument."
+                exit 1
+            fi
+            MODEL_INPUT="$2"
+            shift 2
+            ;;
+        *)
+            echo "❌ ERROR: Unknown argument: $1"
+            usage
             exit 1
             ;;
     esac
 done
 
-if [ -n "$SPECIFIC_NODES" ] && [ "$MODEL_PROVIDED" = false ]; then
-    echo "❌ ERROR: Custom CPU model name (-m) is mandatory when specific nodes (-n) are specified."
+# Validation: if -n is specified, then -m is mandatory
+if [ -n "$NODES_INPUT" ] && [ -z "$MODEL_INPUT" ]; then
+    echo "❌ ERROR: Custom CPU model name (-m/--model) is mandatory when specific nodes (-n/--nodes) are specified."
     exit 1
+fi
+
+# Set the target model name
+if [ -n "$MODEL_INPUT" ]; then
+    TARGET_MODEL="$MODEL_INPUT"
 fi
 
 # Validate the custom CPU model name against Proxmox's strict syntax rules
@@ -34,12 +75,6 @@ if [[ ! "$TARGET_MODEL" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     echo "   Please remove spaces, plus signs (+), or special characters and try again."
     exit 1
 fi
-
-CUSTOM_CPU_DIR="/etc/pve/virtual-guest"
-CUSTOM_CPU_FILE="${CUSTOM_CPU_DIR}/cpu-models.conf"
-
-# Explicitly block physical hardware/power-management flags that KVM refuses to virtualize
-BLOCKLIST=("acpi" "tm" "tm2" "pbe" "dtes64" "monitor" "ds-cpl" "smx" "est" "xtpr" "vnmi" "pdcm" "ht" "dts" "ds" "vme")
 
 echo "=== Checking Dependencies ==="
 DEPENDENCIES=("jq" "pvesh" "awk" "ssh" "qemu-system-x86_64")
@@ -69,23 +104,50 @@ echo "✓ Loaded ${#QEMU_ALLOWED_FLAGS[@]} QEMU-supported flags."
 echo ""
 
 echo "=== Querying Proxmox Cluster Nodes ==="
-if [ -n "$SPECIFIC_NODES" ]; then
-    # Convert comma-separated input into space-separated string for loop
-    NODES=$(echo "$SPECIFIC_NODES" | tr ',' ' ')
-else
-    # Fetch all cluster nodes automatically
-    NODES=$(pvesh get /nodes --output-format json | jq -r '.[].node')
+ALL_CLUSTER_NODES=$(pvesh get /nodes --output-format json | jq -r '.[].node')
+
+if [ -z "$ALL_CLUSTER_NODES" ]; then
+    echo "❌ CRITICAL: No cluster nodes found or pvesh failed."
+    exit 1
 fi
 
-if [ -z "$NODES" ]; then
-    echo "ERROR: No cluster nodes found or pvesh failed."
+declare -A VALID_NODES
+for node in $ALL_CLUSTER_NODES; do
+    VALID_NODES["$node"]=1
+done
+
+NODES_TO_CHECK=""
+IS_EXPLICIT_SELECTION=false
+
+if [ -n "$NODES_INPUT" ]; then
+    IS_EXPLICIT_SELECTION=true
+    IFS=',' read -ra ADDR <<< "$NODES_INPUT"
+    for node in "${ADDR[@]}"; do
+        node=$(echo "$node" | tr -d '[:space:]')
+        if [ -z "$node" ]; then
+            continue
+        fi
+        if [ -z "${VALID_NODES[$node]+x}" ]; then
+            echo "❌ CRITICAL: Node '$node' is not a member of this Proxmox cluster."
+            exit 1
+        fi
+        NODES_TO_CHECK="$NODES_TO_CHECK $node"
+    done
+else
+    NODES_TO_CHECK="$ALL_CLUSTER_NODES"
+fi
+
+NODES_TO_CHECK=$(echo "$NODES_TO_CHECK" | sed 's/^[ \t]*//;s/[ \t]*$//')
+
+if [ -z "$NODES_TO_CHECK" ]; then
+    echo "❌ CRITICAL: No nodes specified or resolved."
     exit 1
 fi
 
 INITIAL_NODE=true
 declare -A COMMON_FLAGS
 
-for NODE in $NODES; do
+for NODE in $NODES_TO_CHECK; do
     echo -n "Checking node: $NODE... "
     
     NODE_FLAGS=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$NODE" "grep -m1 '^flags' /proc/cpuinfo" 2>/dev/null | \
@@ -93,8 +155,14 @@ for NODE in $NODES; do
                  tr '_' '-' ) || true
                  
     if [ -z "$NODE_FLAGS" ]; then
-        echo "WARNING: Could not fetch CPU flags."
-        continue
+        if [ "$IS_EXPLICIT_SELECTION" = true ]; then
+            echo "❌ FAILED!"
+            echo "❌ CRITICAL: Could not fetch CPU flags from explicitly requested node '$NODE'."
+            exit 1
+        else
+            echo "WARNING: Could not fetch CPU flags. Skipping node."
+            continue
+        fi
     fi
 
     FLAG_COUNT=$(echo "$NODE_FLAGS" | wc -w)
@@ -128,8 +196,10 @@ ADDED_COUNT=0
 MAPFILE_SORTED=($(for key in "${!COMMON_FLAGS[@]}"; do echo "$key"; done | sort))
 
 for FLAG in "${MAPFILE_SORTED[@]}"; do
+    # 1. Check if QEMU supports it
     if [ -n "${QEMU_ALLOWED_FLAGS[$FLAG]+x}" ]; then
         
+        # 2. Check if it is on the KVM blocklist
         IS_BLOCKED=false
         for BLOCKED in "${BLOCKLIST[@]}"; do
             if [ "$FLAG" == "$BLOCKED" ]; then
@@ -138,6 +208,7 @@ for FLAG in "${MAPFILE_SORTED[@]}"; do
             fi
         done
         
+        # 3. Add to config if it passes both checks
         if [ "$IS_BLOCKED" = false ]; then
             CONFIG_FLAGS="${CONFIG_FLAGS}+${FLAG};"
             ADDED_COUNT=$((ADDED_COUNT + 1))
