@@ -1,72 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Default values
 TARGET_MODEL="x86-64-CLUSTER-MAX"
-CUSTOM_CPU_DIR="/etc/pve/virtual-guest"
-CUSTOM_CPU_FILE="${CUSTOM_CPU_DIR}/cpu-models.conf"
-BLOCKLIST=("acpi" "tm" "tm2" "pbe" "dtes64" "monitor" "ds-cpl" "smx" "est" "xtpr" "vnmi" "pdcm" "ht" "dts" "ds" "vme")
+MODEL_PROVIDED=false
+SPECIFIC_NODES=""
 
-# Help function
-usage() {
-    echo "Proxmox Max Cluster CPU Generator"
-    echo ""
-    echo "Usage: $0 [options]"
-    echo ""
-    echo "Options:"
-    echo "  -n, --nodes <list>   Comma-separated list of specific nodes to query (e.g. node1,node2)"
-    echo "  -m, --model <name>   Custom name for the generated CPU profile (e.g. x86-64-CUSTOM)"
-    echo "                       (Mandatory if -n/--nodes is specified)"
-    echo "  -h, --help           Show this help message"
-    echo ""
-    echo "If no options are specified, the script automatically queries all active cluster nodes"
-    echo "and defaults the model name to 'x86-64-CLUSTER-MAX'."
-    exit 0
-}
-
-# Option parsing
-NODES_INPUT=""
-MODEL_INPUT=""
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -h|--help)
-            usage
+# Parse command line arguments
+while getopts "m:n:" opt; do
+    case ${opt} in
+        m)
+            TARGET_MODEL=$OPTARG
+            MODEL_PROVIDED=true
             ;;
-        -n|--nodes)
-            if [ -z "${2+x}" ] || [[ "$2" =~ ^- ]]; then
-                echo "❌ ERROR: --nodes requires a non-empty argument."
-                exit 1
-            fi
-            NODES_INPUT="$2"
-            shift 2
+        n)
+            SPECIFIC_NODES=$OPTARG
             ;;
-        -m|--model)
-            if [ -z "${2+x}" ] || [[ "$2" =~ ^- ]]; then
-                echo "❌ ERROR: --model requires a non-empty argument."
-                exit 1
-            fi
-            MODEL_INPUT="$2"
-            shift 2
-            ;;
-        *)
-            echo "❌ ERROR: Unknown argument: $1"
-            usage
+        \?)
+            echo "Usage: $0 [-m custom_model_name] [-n node1,node2]"
             exit 1
             ;;
     esac
 done
 
-# Validation: if -n is specified, then -m is mandatory
-if [ -n "$NODES_INPUT" ] && [ -z "$MODEL_INPUT" ]; then
-    echo "❌ ERROR: Custom CPU model name (-m/--model) is mandatory when specific nodes (-n/--nodes) are specified."
+if [ -n "$SPECIFIC_NODES" ] && [ "$MODEL_PROVIDED" = false ]; then
+    echo "❌ ERROR: Custom CPU model name (-m) is mandatory when specific nodes (-n) are specified."
     exit 1
 fi
 
-# Set the target model name
-if [ -n "$MODEL_INPUT" ]; then
-    TARGET_MODEL="$MODEL_INPUT"
+# Validate the custom CPU model name against Proxmox's strict syntax rules
+if [[ ! "$TARGET_MODEL" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "❌ ERROR: Model name '$TARGET_MODEL' contains invalid characters."
+    echo "   Proxmox strictly requires letters, numbers, dashes (-), and underscores (_)."
+    echo "   Please remove spaces, plus signs (+), or special characters and try again."
+    exit 1
 fi
+
+CUSTOM_CPU_DIR="/etc/pve/virtual-guest"
+CUSTOM_CPU_FILE="${CUSTOM_CPU_DIR}/cpu-models.conf"
+
+# Explicitly block physical hardware/power-management flags that KVM refuses to virtualize
+BLOCKLIST=("acpi" "tm" "tm2" "pbe" "dtes64" "monitor" "ds-cpl" "smx" "est" "xtpr" "vnmi" "pdcm" "ht" "dts" "ds" "vme")
 
 echo "=== Checking Dependencies ==="
 DEPENDENCIES=("jq" "pvesh" "awk" "ssh" "qemu-system-x86_64")
@@ -96,50 +69,23 @@ echo "✓ Loaded ${#QEMU_ALLOWED_FLAGS[@]} QEMU-supported flags."
 echo ""
 
 echo "=== Querying Proxmox Cluster Nodes ==="
-ALL_CLUSTER_NODES=$(pvesh get /nodes --output-format json | jq -r '.[].node')
-
-if [ -z "$ALL_CLUSTER_NODES" ]; then
-    echo "❌ CRITICAL: No cluster nodes found or pvesh failed."
-    exit 1
-fi
-
-declare -A VALID_NODES
-for node in $ALL_CLUSTER_NODES; do
-    VALID_NODES["$node"]=1
-done
-
-NODES_TO_CHECK=""
-IS_EXPLICIT_SELECTION=false
-
-if [ -n "$NODES_INPUT" ]; then
-    IS_EXPLICIT_SELECTION=true
-    IFS=',' read -ra ADDR <<< "$NODES_INPUT"
-    for node in "${ADDR[@]}"; do
-        node=$(echo "$node" | tr -d '[:space:]')
-        if [ -z "$node" ]; then
-            continue
-        fi
-        if [ -z "${VALID_NODES[$node]+x}" ]; then
-            echo "❌ CRITICAL: Node '$node' is not a member of this Proxmox cluster."
-            exit 1
-        fi
-        NODES_TO_CHECK="$NODES_TO_CHECK $node"
-    done
+if [ -n "$SPECIFIC_NODES" ]; then
+    # Convert comma-separated input into space-separated string for loop
+    NODES=$(echo "$SPECIFIC_NODES" | tr ',' ' ')
 else
-    NODES_TO_CHECK="$ALL_CLUSTER_NODES"
+    # Fetch all cluster nodes automatically
+    NODES=$(pvesh get /nodes --output-format json | jq -r '.[].node')
 fi
 
-NODES_TO_CHECK=$(echo "$NODES_TO_CHECK" | sed 's/^[ \t]*//;s/[ \t]*$//')
-
-if [ -z "$NODES_TO_CHECK" ]; then
-    echo "❌ CRITICAL: No nodes specified or resolved."
+if [ -z "$NODES" ]; then
+    echo "ERROR: No cluster nodes found or pvesh failed."
     exit 1
 fi
 
 INITIAL_NODE=true
 declare -A COMMON_FLAGS
 
-for NODE in $NODES_TO_CHECK; do
+for NODE in $NODES; do
     echo -n "Checking node: $NODE... "
     
     NODE_FLAGS=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$NODE" "grep -m1 '^flags' /proc/cpuinfo" 2>/dev/null | \
@@ -147,14 +93,8 @@ for NODE in $NODES_TO_CHECK; do
                  tr '_' '-' ) || true
                  
     if [ -z "$NODE_FLAGS" ]; then
-        if [ "$IS_EXPLICIT_SELECTION" = true ]; then
-            echo "❌ FAILED!"
-            echo "❌ CRITICAL: Could not fetch CPU flags from explicitly requested node '$NODE'."
-            exit 1
-        else
-            echo "WARNING: Could not fetch CPU flags. Skipping node."
-            continue
-        fi
+        echo "WARNING: Could not fetch CPU flags."
+        continue
     fi
 
     FLAG_COUNT=$(echo "$NODE_FLAGS" | wc -w)
@@ -188,10 +128,8 @@ ADDED_COUNT=0
 MAPFILE_SORTED=($(for key in "${!COMMON_FLAGS[@]}"; do echo "$key"; done | sort))
 
 for FLAG in "${MAPFILE_SORTED[@]}"; do
-    # 1. Check if QEMU supports it
     if [ -n "${QEMU_ALLOWED_FLAGS[$FLAG]+x}" ]; then
         
-        # 2. Check if it is on the KVM blocklist
         IS_BLOCKED=false
         for BLOCKED in "${BLOCKLIST[@]}"; do
             if [ "$FLAG" == "$BLOCKED" ]; then
@@ -200,7 +138,6 @@ for FLAG in "${MAPFILE_SORTED[@]}"; do
             fi
         done
         
-        # 3. Add to config if it passes both checks
         if [ "$IS_BLOCKED" = false ]; then
             CONFIG_FLAGS="${CONFIG_FLAGS}+${FLAG};"
             ADDED_COUNT=$((ADDED_COUNT + 1))
@@ -224,9 +161,12 @@ echo "=== Writing Custom Cluster Profile ==="
 mkdir -p "$CUSTOM_CPU_DIR"
 touch "$CUSTOM_CPU_FILE"
 
+# Create a safe backup before writing any changes
+cp "$CUSTOM_CPU_FILE" "${CUSTOM_CPU_FILE}.bak"
+echo "✓ Pre-modification backup created at: ${CUSTOM_CPU_FILE}.bak"
+
 if grep -q "^cpu-model: ${TARGET_MODEL}$" "$CUSTOM_CPU_FILE"; then
-    echo "Profile ${TARGET_MODEL} already exists. Updating entry..."
-    cp "$CUSTOM_CPU_FILE" "${CUSTOM_CPU_FILE}.bak"
+    echo "Profile ${TARGET_MODEL} already exists in config. Updating entry..."
     
     TMP_FILE=$(mktemp)
     awk -v target="cpu-model: ${TARGET_MODEL}" '
@@ -236,15 +176,21 @@ if grep -q "^cpu-model: ${TARGET_MODEL}$" "$CUSTOM_CPU_FILE"; then
         !skip { print }
     ' "$CUSTOM_CPU_FILE" > "$TMP_FILE"
     
-    cat "$TMP_FILE" > "$CUSTOM_CPU_FILE"
+    # Clean up excess empty lines to keep the file neat
+    awk 'NF > 0 {blank=0} NF == 0 {blank++} blank < 2' "$TMP_FILE" > "$CUSTOM_CPU_FILE"
     rm "$TMP_FILE"
 fi
 
-cat << EOF >> "$CUSTOM_CPU_FILE"
-cpu-model: ${TARGET_MODEL}
-    flags ${CONFIG_FLAGS}
-    reported-model qemu64
-    hv-vendor-id QEMU
-EOF
+echo "✓ Appending configuration to: ${CUSTOM_CPU_FILE}"
+# Append the new profile with strict Proxmox GUI formatting
+# \n ensures the mandatory blank line separation
+# \t ensures exact tab indentation instead of spaces
+{
+    echo -e "\ncpu-model: ${TARGET_MODEL}"
+    echo -e "\thv-vendor-id QEMU"
+    echo -e "\treported-model qemu64"
+    echo -e "\tflags ${CONFIG_FLAGS}"
+} >> "$CUSTOM_CPU_FILE"
 
 echo "✓ Successfully created custom profile: ${TARGET_MODEL}"
+echo "This model will sync cluster-wide immediately via pmxcfs."
